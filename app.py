@@ -48,13 +48,25 @@ PROFILES_DIR = "profiles"  # per-user cached data lives here
 
 def get_stockfish_path():
     """
-    Tries your known local Windows path first (for local testing),
-    and falls back to just "stockfish" (assumes it's on the system PATH,
-    which is true on Streamlit Cloud once packages.txt installs it).
+    Tries your known local Windows path first (for local testing).
+    On Linux (Streamlit Cloud), checks common install locations directly --
+    the apt "stockfish" package often installs to /usr/games/stockfish,
+    which isn't always included in the PATH Streamlit's environment uses,
+    so shutil.which() alone can miss it.
     """
     local_path = r"C:\Users\omega\Downloads\stockfish-windows-x86-64-universal\stockfish\stockfish-windows-x86-64-universal.exe"
     if os.path.exists(local_path):
         return local_path
+
+    common_linux_paths = [
+        "/usr/games/stockfish",
+        "/usr/bin/stockfish",
+        "/usr/local/bin/stockfish",
+        "/usr/local/games/stockfish",
+    ]
+    for path in common_linux_paths:
+        if os.path.exists(path):
+            return path
 
     found = shutil.which("stockfish")
     if found:
