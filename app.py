@@ -39,7 +39,7 @@ FEEDBACK_FORM_URL = "https://forms.gle/e1PbTnmRrAUj15UV8"
 
 TIME_CLASSES = {"rapid", "blitz"}
 MULTIPV = 5
-ENGINE_TIME_LIMIT = 0.15
+GAMEPLAY_DEPTH = 8  # fixed depth for live bot moves -- more predictable than a wall-clock time limit on shared/slower cloud hardware
 
 # Live profile-building settings -- kept small/fast since this now runs
 # in real time whenever a NEW visitor enters their username, rather than
@@ -355,12 +355,28 @@ def render_board_image(board, orientation, selected_square=None):
     Renders the board as a PNG image (via cairosvg converting python-chess's
     SVG output) so it can be shown with streamlit_image_coordinates, which
     needs a raster image to detect click positions on.
+
+    When a square is selected, also highlights every square that piece can
+    legally move to (small dots, same idea as chess.com/lichess) using
+    python-chess's built-in "squares" highlighting.
     """
     fill = {}
+    legal_dest_squares = chess.SquareSet()
+
     if selected_square is not None:
         fill[selected_square] = "#aaa23b"
+        dest_squares = [
+            move.to_square for move in board.legal_moves if move.from_square == selected_square
+        ]
+        legal_dest_squares = chess.SquareSet(dest_squares)
 
-    svg_text = chess.svg.board(board=board, size=400, orientation=orientation, fill=fill)
+    svg_text = chess.svg.board(
+        board=board,
+        size=400,
+        orientation=orientation,
+        fill=fill,
+        squares=legal_dest_squares,
+    )
     png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=400, output_height=400)
     return Image.open(io.BytesIO(png_bytes))
 
@@ -388,7 +404,7 @@ def square_from_click(x, y, orientation):
 
 
 def choose_bot_move(board, engine, temperature):
-    info = engine.analyse(board, chess.engine.Limit(time=ENGINE_TIME_LIMIT), multipv=MULTIPV)
+    info = engine.analyse(board, chess.engine.Limit(depth=GAMEPLAY_DEPTH), multipv=MULTIPV)
 
     candidates = []
     for entry in info:
@@ -504,7 +520,8 @@ elif st.session_state.stage == "playing":
 
         board.push(move)
         st.session_state.move_count += 1
-        st.session_state.view_index = len(board.move_stack)
+        if "round_pointer" in st.session_state:
+            del st.session_state["round_pointer"]
         st.session_state.selected_square = None
         st.rerun()
 
@@ -587,7 +604,8 @@ elif st.session_state.stage == "playing":
                     if move in board.legal_moves:
                         board.push(move)
                         st.session_state.move_count += 1
-                        st.session_state.view_index = len(board.move_stack)
+                        if "round_pointer" in st.session_state:
+                            del st.session_state["round_pointer"]
                         st.session_state.selected_square = None
                         st.rerun()
                     elif piece_at_click is not None and piece_at_click.color == side_to_move:
