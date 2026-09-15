@@ -1,3 +1,7 @@
 streamlit
 requests
 python-chess
+chess
+python-chess
+requests
+streamlit
