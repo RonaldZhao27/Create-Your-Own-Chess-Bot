@@ -27,6 +27,7 @@ import json
 import os
 import random
 import math
+import re
 import requests
 import shutil
 import cairosvg
@@ -328,6 +329,59 @@ def get_position_history(final_board):
     return positions
 
 
+def get_board_grid_geometry(svg_text, size):
+    """
+    With coordinate labels enabled, python-chess's SVG board doesn't
+    necessarily fill the full image edge-to-edge -- some space may be
+    used for the file/rank labels, and exactly how much can depend on
+    the library version. Rather than assume a fixed margin (which is
+    what caused the earlier dot-alignment bug), this parses the actual
+    <rect> elements python-chess draws for the checkered squares and
+    measures their real pixel position and size directly -- so our
+    click/marker math is always correct for whatever is really rendered.
+    """
+    rect_tag_pattern = re.compile(r"<rect\b([^>]*)/?>")
+    attr_pattern = re.compile(r'([\w:-]+)="([^"]*)"')
+
+    candidates = []
+    for rect_match in rect_tag_pattern.finditer(svg_text):
+        attrs = dict(attr_pattern.findall(rect_match.group(1)))
+        try:
+            x = float(attrs.get("x", "nan"))
+            y = float(attrs.get("y", "nan"))
+            w = float(attrs.get("width", "nan"))
+            h = float(attrs.get("height", "nan"))
+        except ValueError:
+            continue
+        if any(math.isnan(v) for v in (x, y, w, h)):
+            continue
+        # a real chess square is roughly square-shaped and clearly
+        # smaller than the whole image (excludes any full-canvas
+        # background rect that happens to also be size x size)
+        if abs(w - h) < 0.01 and 0 < w < size / 2:
+            candidates.append((round(x, 2), round(y, 2), w))
+
+    if not candidates:
+        # fallback: assume the grid fills the image with no margin
+        return 0.0, 0.0, size / 8
+
+    square_size = candidates[0][2]
+    origin_x = min(c[0] for c in candidates)
+    origin_y = min(c[1] for c in candidates)
+    return origin_x, origin_y, square_size
+
+
+@st.cache_resource
+def get_grid_geometry():
+    """
+    The grid's pixel position never changes between renders (same size,
+    same coordinate settings every time) -- only the pieces move -- so
+    we measure it once on a fresh board and reuse it everywhere.
+    """
+    sample_svg = chess.svg.board(board=chess.Board(), size=400, coordinates=True)
+    return get_board_grid_geometry(sample_svg, 400)
+
+
 def render_board_image(board, orientation, selected_square=None):
     """
     Renders the board as a PNG image (via cairosvg converting python-chess's
@@ -335,18 +389,27 @@ def render_board_image(board, orientation, selected_square=None):
     needs a raster image to detect click positions on.
 
     When a square is selected, draws a small dot on every square that piece
-    can legally move to (same idea as chess.com/lichess). We draw these
-    ourselves rather than using python-chess's built-in "squares" highlight,
-    since that renders captures as an X rather than a dot.
+    can legally move to for a quiet move, or a ring around the square for
+    a capture (matching Lichess's convention) -- drawn manually rather than
+    using python-chess's built-in "squares" highlight, since that renders
+    captures as an X and doesn't distinguish capture vs quiet moves.
+
+    coordinate labels are enabled (coordinates=True) since you want them
+    visible -- the grid position is measured at runtime via
+    get_grid_geometry() rather than assumed, so the dots/rings and click
+    detection stay correctly aligned regardless of how much space the
+    labels actually take up.
 
     If the side to move is in check, the king's square gets a red tint,
-    using python-chess's built-in "check" highlighting.
+    using python-chess's built-in "check" highlighting. The most recently
+    played move is also highlighted, using python-chess's "lastmove".
     """
     fill = {}
     if selected_square is not None:
         fill[selected_square] = "#aaa23b"
 
     check_square = board.king(board.turn) if board.is_check() else None
+    last_move = board.peek() if board.move_stack else None
 
     svg_text = chess.svg.board(
         board=board,
@@ -354,15 +417,19 @@ def render_board_image(board, orientation, selected_square=None):
         orientation=orientation,
         fill=fill,
         check=check_square,
+        lastmove=last_move,
+        coordinates=True,
     )
 
     if selected_square is not None:
-        dest_squares = [
-            move.to_square for move in board.legal_moves if move.from_square == selected_square
-        ]
-        square_size = 400 / 8
-        dots_svg = ""
-        for dest_square in dest_squares:
+        origin_x, origin_y, square_size = get_grid_geometry()
+        markers_svg = ""
+        for move in board.legal_moves:
+            if move.from_square != selected_square:
+                continue
+            dest_square = move.to_square
+            is_capture = board.is_capture(move)
+
             file_idx = chess.square_file(dest_square)
             rank_idx = chess.square_rank(dest_square)
             if orientation == chess.WHITE:
@@ -371,13 +438,22 @@ def render_board_image(board, orientation, selected_square=None):
             else:
                 col = 7 - file_idx
                 row = rank_idx
-            center_x = col * square_size + square_size / 2
-            center_y = row * square_size + square_size / 2
-            dots_svg += (
-                f'<circle cx="{center_x}" cy="{center_y}" r="8" '
-                f'fill="rgba(0,0,0,0.35)" />'
-            )
-        svg_text = svg_text.replace("</svg>", dots_svg + "</svg>")
+            center_x = origin_x + col * square_size + square_size / 2
+            center_y = origin_y + row * square_size + square_size / 2
+
+            if is_capture:
+                # ring around the edge of the square, so the piece being
+                # captured is still visible underneath -- matches Lichess
+                markers_svg += (
+                    f'<circle cx="{center_x}" cy="{center_y}" r="{square_size / 2 - 3}" '
+                    f'fill="none" stroke="rgba(0,0,0,0.4)" stroke-width="4" />'
+                )
+            else:
+                markers_svg += (
+                    f'<circle cx="{center_x}" cy="{center_y}" r="8" '
+                    f'fill="rgba(0,0,0,0.35)" />'
+                )
+        svg_text = svg_text.replace("</svg>", markers_svg + "</svg>")
 
     png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=400, output_height=400)
     return Image.open(io.BytesIO(png_bytes))
@@ -387,11 +463,13 @@ def square_from_click(x, y, orientation):
     """
     Converts a pixel click position on the 400x400 board image into the
     actual chess square underneath it, accounting for whether the board
-    is currently drawn from White's or Black's perspective.
+    is currently drawn from White's or Black's perspective. Uses the
+    measured grid geometry (get_grid_geometry) rather than assuming the
+    grid starts at pixel (0,0), since coordinate labels may offset it.
     """
-    square_size = 400 / 8
-    col = int(x // square_size)
-    row = int(y // square_size)
+    origin_x, origin_y, square_size = get_grid_geometry()
+    col = int((x - origin_x) // square_size)
+    row = int((y - origin_y) // square_size)
     col = max(0, min(7, col))
     row = max(0, min(7, row))
 
@@ -615,8 +693,14 @@ elif st.session_state.stage == "playing":
     else:
         # browsing history or game over -- static, non-clickable image
         static_check_square = display_board.king(display_board.turn) if display_board.is_check() else None
+        static_last_move = display_board.peek() if display_board.move_stack else None
         board_svg = chess.svg.board(
-            board=display_board, size=400, orientation=board_orientation, check=static_check_square
+            board=display_board,
+            size=400,
+            orientation=board_orientation,
+            check=static_check_square,
+            lastmove=static_last_move,
+            coordinates=True,
         )
         st.image(board_svg, use_container_width=False)
 
