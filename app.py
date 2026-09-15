@@ -29,6 +29,12 @@ import random
 import math
 import requests
 import shutil
+import cairosvg
+from PIL import Image
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+
+FEEDBACK_FORM_URL = "https://forms.gle/e1PbTnmRrAUj15UV8"
 
 
 TIME_CLASSES = {"rapid", "blitz"}
@@ -80,9 +86,16 @@ STOCKFISH_PATH = get_stockfish_path()
 
 # ---- Chess.com API helpers ----
 
+class UsernameNotFoundError(Exception):
+    """Raised specifically when Chess.com has no account with this username."""
+    pass
+
+
 def get_archive_urls(username):
     url = f"https://api.chess.com/pub/player/{username}/games/archives"
     response = requests.get(url, headers={"User-Agent": "chess-bot-project"})
+    if response.status_code == 404:
+        raise UsernameNotFoundError(username)
     response.raise_for_status()
     return response.json()["archives"]
 
@@ -101,10 +114,19 @@ def get_games_from_archive(archive_url):
 
 
 def get_all_pgns(username):
-    archive_urls = get_archive_urls(username)
+    """
+    Raises UsernameNotFoundError if the username doesn't exist on Chess.com.
+    Returns an empty list if the username exists but some other request
+    problem occurs, so the caller can distinguish the two cases.
+    """
+    archive_urls = get_archive_urls(username)  # lets UsernameNotFoundError bubble up
+
     all_pgns = []
     for archive_url in archive_urls:
-        all_pgns.extend(get_games_from_archive(archive_url))
+        try:
+            all_pgns.extend(get_games_from_archive(archive_url))
+        except requests.exceptions.RequestException:
+            continue  # skip a bad month rather than failing the whole pull
     return all_pgns
 
 
@@ -188,10 +210,14 @@ def build_first_move_distribution(pgns, username):
 
 def build_profile_for_user(username, engine, status_placeholder):
     status_placeholder.info(f"Pulling {username}'s games from Chess.com...")
-    all_pgns = get_all_pgns(username)
+
+    try:
+        all_pgns = get_all_pgns(username)
+    except UsernameNotFoundError:
+        return None, None, None, None, "username_not_found"
 
     if len(all_pgns) == 0:
-        return None, None, None, None
+        return None, None, None, None, "no_games"
 
     status_placeholder.info(
         f"Found {len(all_pgns)} rapid/blitz games. Building your style profile..."
@@ -205,7 +231,7 @@ def build_profile_for_user(username, engine, status_placeholder):
             game_results.append(result)
 
     if not game_results:
-        return None, None, None, None
+        return None, None, None, None, "no_games"
 
     all_losses = [g["avg_centipawn_loss"] for g in game_results]
     all_blunder_rates = [g["blunder_rate"] for g in game_results]
@@ -219,7 +245,7 @@ def build_profile_for_user(username, engine, status_placeholder):
 
     white_first_moves, black_first_moves = build_first_move_distribution(all_pgns, username)
 
-    return profile, white_first_moves, black_first_moves, all_pgns
+    return profile, white_first_moves, black_first_moves, all_pgns, None
 
 
 def compute_temperature(profile):
@@ -239,14 +265,14 @@ def get_or_build_profile(username, engine, status_placeholder):
     if os.path.exists(profile_path):
         with open(profile_path, "r") as f:
             data = json.load(f)
-        return data["profile"], data["white_first_moves"], data["black_first_moves"]
+        return data["profile"], data["white_first_moves"], data["black_first_moves"], None
 
-    profile, white_first_moves, black_first_moves, _ = build_profile_for_user(
+    profile, white_first_moves, black_first_moves, _, error_reason = build_profile_for_user(
         username, engine, status_placeholder
     )
 
     if profile is None:
-        return None, None, None
+        return None, None, None, error_reason
 
     with open(profile_path, "w") as f:
         json.dump(
@@ -258,7 +284,7 @@ def get_or_build_profile(username, engine, status_placeholder):
             f,
         )
 
-    return profile, white_first_moves, black_first_moves
+    return profile, white_first_moves, black_first_moves, None
 
 
 def weighted_choice(options_dict):
@@ -302,19 +328,63 @@ def get_position_history(final_board):
     return positions
 
 
-def undo_last_round(board, user_plays_white):
+def get_round_boundary_indices(positions, user_plays_white):
     """
-    Pops moves off the board until it's the user's turn again -- so one
-    click of "Undo" takes back both your last move AND the bot's reply,
-    returning control to you rather than leaving it on the bot's turn.
+    Not every ply is a natural place to "resume playing" -- only the
+    positions where it's about to be YOUR turn (i.e. right after the
+    bot has replied) make sense as round boundaries. This lets Back/Forward
+    move a full round at a time instead of one ply at a time, matching
+    how a person actually thinks about "my move, then their move."
+
+    Always includes position 0 (start) and the final position (even if
+    the game ended abruptly on your own move, before the bot could reply).
     """
-    while board.move_stack:
-        board.pop()
-        is_users_turn = (board.turn == chess.WHITE and user_plays_white) or (
-            board.turn == chess.BLACK and not user_plays_white
+    indices = [0]
+    for i in range(1, len(positions)):
+        board_at_i = positions[i]
+        is_users_turn = (board_at_i.turn == chess.WHITE and user_plays_white) or (
+            board_at_i.turn == chess.BLACK and not user_plays_white
         )
-        if is_users_turn:
-            break
+        if is_users_turn or i == len(positions) - 1:
+            indices.append(i)
+    return indices
+
+
+def render_board_image(board, orientation, selected_square=None):
+    """
+    Renders the board as a PNG image (via cairosvg converting python-chess's
+    SVG output) so it can be shown with streamlit_image_coordinates, which
+    needs a raster image to detect click positions on.
+    """
+    fill = {}
+    if selected_square is not None:
+        fill[selected_square] = "#aaa23b"
+
+    svg_text = chess.svg.board(board=board, size=400, orientation=orientation, fill=fill)
+    png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=400, output_height=400)
+    return Image.open(io.BytesIO(png_bytes))
+
+
+def square_from_click(x, y, orientation):
+    """
+    Converts a pixel click position on the 400x400 board image into the
+    actual chess square underneath it, accounting for whether the board
+    is currently drawn from White's or Black's perspective.
+    """
+    square_size = 400 / 8
+    col = int(x // square_size)
+    row = int(y // square_size)
+    col = max(0, min(7, col))
+    row = max(0, min(7, row))
+
+    if orientation == chess.WHITE:
+        file_idx = col
+        rank_idx = 7 - row
+    else:
+        file_idx = 7 - col
+        rank_idx = row
+
+    return chess.square(file_idx, rank_idx)
 
 
 def choose_bot_move(board, engine, temperature):
@@ -351,6 +421,7 @@ def get_engine():
 st.set_page_config(page_title="Play Your Own Chess Bot", layout="centered")
 st.title("Play Your Own Chess Bot")
 st.caption("Enter any Chess.com username to build a bot that plays like them.")
+st.link_button("Report a bug / suggestion", FEEDBACK_FORM_URL)
 
 engine = get_engine()
 
@@ -363,16 +434,22 @@ if st.session_state.stage == "enter_username":
     if st.button("Build My Bot") and username_input.strip():
         status_placeholder = st.empty()
         with st.spinner("This takes about 30-60 seconds the first time..."):
-            profile, white_first_moves, black_first_moves = get_or_build_profile(
+            profile, white_first_moves, black_first_moves, error_reason = get_or_build_profile(
                 username_input.strip(), engine, status_placeholder
             )
         status_placeholder.empty()
 
         if profile is None:
-            st.error(
-                "Couldn't find enough rapid/blitz games for that username. "
-                "Double check the spelling, or try a different account."
-            )
+            if error_reason == "username_not_found":
+                st.error(
+                    f"'{username_input.strip()}' isn't a Chess.com username. "
+                    "Double check the spelling and try again."
+                )
+            else:
+                st.error(
+                    "That username exists, but doesn't have enough rapid/blitz games "
+                    "to build a profile from. Try a different account."
+                )
         else:
             st.session_state.username = username_input.strip()
             st.session_state.profile = profile
@@ -405,6 +482,11 @@ elif st.session_state.stage == "playing":
     white_first_moves = st.session_state.white_first_moves
     black_first_moves = st.session_state.black_first_moves
 
+    if "selected_square" not in st.session_state:
+        st.session_state.selected_square = None
+    if "last_click_processed" not in st.session_state:
+        st.session_state.last_click_processed = None
+
     bot_plays_white = not st.session_state.user_plays_white
     is_bots_turn = (board.turn == chess.WHITE and bot_plays_white) or (
         board.turn == chess.BLACK and not bot_plays_white
@@ -423,103 +505,116 @@ elif st.session_state.stage == "playing":
         board.push(move)
         st.session_state.move_count += 1
         st.session_state.view_index = len(board.move_stack)
+        st.session_state.selected_square = None
         st.rerun()
 
     move_history = get_move_history_string(board)
     if move_history:
         st.text_area("Move history", move_history, height=80, disabled=True)
 
-    # --- position browsing ---
+    # --- position browsing (by full round, not raw half-move) ---
     positions = get_position_history(board)
     last_index = len(positions) - 1
+    round_indices = get_round_boundary_indices(positions, st.session_state.user_plays_white)
+    total_rounds = len(round_indices) - 1  # excludes the starting position
 
-    if "view_index" not in st.session_state:
-        st.session_state.view_index = last_index
+    if "round_pointer" not in st.session_state:
+        st.session_state.round_pointer = total_rounds
     # whenever a new move has been played, snap the view back to live
-    if st.session_state.view_index > last_index:
-        st.session_state.view_index = last_index
+    if st.session_state.round_pointer > total_rounds:
+        st.session_state.round_pointer = total_rounds
 
-    viewing_live = st.session_state.view_index == last_index
+    viewing_live = st.session_state.round_pointer == total_rounds
+    view_ply_index = round_indices[st.session_state.round_pointer]
 
     nav_cols = st.columns(4)
     with nav_cols[0]:
-        if st.button("|< Start", disabled=(st.session_state.view_index == 0)):
-            st.session_state.view_index = 0
+        if st.button("|< Start", disabled=(st.session_state.round_pointer == 0)):
+            st.session_state.round_pointer = 0
             st.rerun()
     with nav_cols[1]:
-        if st.button("< Back", disabled=(st.session_state.view_index == 0)):
-            st.session_state.view_index -= 1
+        if st.button("< Back", disabled=(st.session_state.round_pointer == 0)):
+            st.session_state.round_pointer -= 1
             st.rerun()
     with nav_cols[2]:
         if st.button("Forward >", disabled=viewing_live):
-            st.session_state.view_index += 1
+            st.session_state.round_pointer += 1
             st.rerun()
     with nav_cols[3]:
         if st.button("Current >|", disabled=viewing_live):
-            st.session_state.view_index = last_index
+            st.session_state.round_pointer = total_rounds
             st.rerun()
 
     if not viewing_live:
-        st.info(f"Viewing move {st.session_state.view_index} of {last_index} — not the current position.")
+        st.info(f"Viewing move {st.session_state.round_pointer} of {total_rounds} — not the current position.")
 
-    display_board = positions[st.session_state.view_index]
+    display_board = positions[view_ply_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
-    board_svg = chess.svg.board(board=display_board, size=400, orientation=board_orientation)
-    st.image(board_svg, use_container_width=False)
 
-    # only allow actually playing moves / undoing when looking at the
-    # live position -- browsing history is view-only
-    if not viewing_live:
+    if viewing_live and not board.is_game_over():
+        # click-to-move: render as a clickable image instead of a static one
+        board_image = render_board_image(display_board, board_orientation, st.session_state.selected_square)
+        click_result = streamlit_image_coordinates(board_image, key="board_click")
+
+        if click_result is not None and click_result != st.session_state.last_click_processed:
+            st.session_state.last_click_processed = click_result
+            clicked_square = square_from_click(click_result["x"], click_result["y"], board_orientation)
+            piece_at_click = board.piece_at(clicked_square)
+            side_to_move = board.turn
+
+            if st.session_state.selected_square is None:
+                # first click: only select if there's actually a piece
+                # belonging to whoever's turn it is
+                if piece_at_click is not None and piece_at_click.color == side_to_move:
+                    st.session_state.selected_square = clicked_square
+                    st.rerun()
+            else:
+                if clicked_square == st.session_state.selected_square:
+                    # clicking the same square again deselects it
+                    st.session_state.selected_square = None
+                    st.rerun()
+                else:
+                    from_sq = st.session_state.selected_square
+                    move = chess.Move(from_sq, clicked_square)
+
+                    # handle pawn promotion -- defaults to queen for now
+                    moving_piece = board.piece_at(from_sq)
+                    if moving_piece is not None and moving_piece.piece_type == chess.PAWN:
+                        promo_rank = 7 if moving_piece.color == chess.WHITE else 0
+                        if chess.square_rank(clicked_square) == promo_rank:
+                            move = chess.Move(from_sq, clicked_square, promotion=chess.QUEEN)
+
+                    if move in board.legal_moves:
+                        board.push(move)
+                        st.session_state.move_count += 1
+                        st.session_state.view_index = len(board.move_stack)
+                        st.session_state.selected_square = None
+                        st.rerun()
+                    elif piece_at_click is not None and piece_at_click.color == side_to_move:
+                        # clicked a different one of your own pieces -- reselect
+                        st.session_state.selected_square = clicked_square
+                        st.rerun()
+                    else:
+                        st.session_state.selected_square = None
+                        st.warning("That's not a legal move.")
+                        st.rerun()
+    else:
+        # browsing history or game over -- static, non-clickable image
+        board_svg = chess.svg.board(board=display_board, size=400, orientation=board_orientation)
+        st.image(board_svg, use_container_width=False)
+
+    if board.is_game_over() and viewing_live:
+        st.success(f"Game over: {board.result()}")
+        if st.button("Play Again"):
+            st.session_state.stage = "choose_color"
+            st.rerun()
+    elif not viewing_live:
         st.write("")
         if st.button("New Bot / Restart"):
             st.session_state.stage = "enter_username"
             st.rerun()
-    elif board.is_game_over():
-        st.success(f"Game over: {board.result()}")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Play Again"):
-                st.session_state.stage = "choose_color"
-                st.rerun()
-        with col2:
-            if st.button("Undo Last Round", disabled=(len(board.move_stack) == 0), key="undo_gameover"):
-                undo_last_round(board, st.session_state.user_plays_white)
-                st.session_state.move_count = len(board.move_stack)
-                st.session_state.view_index = len(board.move_stack)
-                st.rerun()
     else:
-        st.write("Your move — click any option below:")
-
-        legal_moves_san = sorted([board.san(m) for m in board.legal_moves])
-
-        # lay moves out in a grid of buttons instead of a dropdown --
-        # avoids the dropdown-opens-upward-and-covers-the-board problem,
-        # and it's one click instead of select-then-confirm
-        moves_per_row = 6
-        for row_start in range(0, len(legal_moves_san), moves_per_row):
-            row_moves = legal_moves_san[row_start:row_start + moves_per_row]
-            cols = st.columns(moves_per_row)
-            for col, san in zip(cols, row_moves):
-                with col:
-                    # key uses the row_start+index so buttons stay unique
-                    # even if (rarely) two legal moves render identically
-                    button_key = f"move_{row_start}_{san}"
-                    if st.button(san, key=button_key):
-                        move = board.parse_san(san)
-                        board.push(move)
-                        st.session_state.move_count += 1
-                        st.session_state.view_index = len(board.move_stack)
-                        st.rerun()
-
-        st.write("")  # small spacer
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Undo Last Round", disabled=(len(board.move_stack) == 0), key="undo_live"):
-                undo_last_round(board, st.session_state.user_plays_white)
-                st.session_state.move_count = len(board.move_stack)
-                st.session_state.view_index = len(board.move_stack)
-                st.rerun()
-        with col2:
-            if st.button("New Bot / Restart"):
-                st.session_state.stage = "enter_username"
-                st.rerun()
+        st.caption("Click a piece, then click where it should move.")
+        if st.button("New Bot / Restart"):
+            st.session_state.stage = "enter_username"
+            st.rerun()

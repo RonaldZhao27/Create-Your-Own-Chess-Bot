@@ -1,3 +1,6 @@
 streamlit
 requests
 python-chess
+cairosvg
+Pillow
+streamlit-image-coordinates
