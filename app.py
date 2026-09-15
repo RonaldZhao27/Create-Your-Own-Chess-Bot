@@ -328,55 +328,57 @@ def get_position_history(final_board):
     return positions
 
 
-def get_round_boundary_indices(positions, user_plays_white):
-    """
-    Not every ply is a natural place to "resume playing" -- only the
-    positions where it's about to be YOUR turn (i.e. right after the
-    bot has replied) make sense as round boundaries. This lets Back/Forward
-    move a full round at a time instead of one ply at a time, matching
-    how a person actually thinks about "my move, then their move."
-
-    Always includes position 0 (start) and the final position (even if
-    the game ended abruptly on your own move, before the bot could reply).
-    """
-    indices = [0]
-    for i in range(1, len(positions)):
-        board_at_i = positions[i]
-        is_users_turn = (board_at_i.turn == chess.WHITE and user_plays_white) or (
-            board_at_i.turn == chess.BLACK and not user_plays_white
-        )
-        if is_users_turn or i == len(positions) - 1:
-            indices.append(i)
-    return indices
-
-
 def render_board_image(board, orientation, selected_square=None):
     """
     Renders the board as a PNG image (via cairosvg converting python-chess's
     SVG output) so it can be shown with streamlit_image_coordinates, which
     needs a raster image to detect click positions on.
 
-    When a square is selected, also highlights every square that piece can
-    legally move to (small dots, same idea as chess.com/lichess) using
-    python-chess's built-in "squares" highlighting.
+    When a square is selected, draws a small dot on every square that piece
+    can legally move to (same idea as chess.com/lichess). We draw these
+    ourselves rather than using python-chess's built-in "squares" highlight,
+    since that renders captures as an X rather than a dot.
+
+    If the side to move is in check, the king's square gets a red tint,
+    using python-chess's built-in "check" highlighting.
     """
     fill = {}
-    legal_dest_squares = chess.SquareSet()
-
     if selected_square is not None:
         fill[selected_square] = "#aaa23b"
-        dest_squares = [
-            move.to_square for move in board.legal_moves if move.from_square == selected_square
-        ]
-        legal_dest_squares = chess.SquareSet(dest_squares)
+
+    check_square = board.king(board.turn) if board.is_check() else None
 
     svg_text = chess.svg.board(
         board=board,
         size=400,
         orientation=orientation,
         fill=fill,
-        squares=legal_dest_squares,
+        check=check_square,
     )
+
+    if selected_square is not None:
+        dest_squares = [
+            move.to_square for move in board.legal_moves if move.from_square == selected_square
+        ]
+        square_size = 400 / 8
+        dots_svg = ""
+        for dest_square in dest_squares:
+            file_idx = chess.square_file(dest_square)
+            rank_idx = chess.square_rank(dest_square)
+            if orientation == chess.WHITE:
+                col = file_idx
+                row = 7 - rank_idx
+            else:
+                col = 7 - file_idx
+                row = rank_idx
+            center_x = col * square_size + square_size / 2
+            center_y = row * square_size + square_size / 2
+            dots_svg += (
+                f'<circle cx="{center_x}" cy="{center_y}" r="8" '
+                f'fill="rgba(0,0,0,0.35)" />'
+            )
+        svg_text = svg_text.replace("</svg>", dots_svg + "</svg>")
+
     png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=400, output_height=400)
     return Image.open(io.BytesIO(png_bytes))
 
@@ -520,8 +522,8 @@ elif st.session_state.stage == "playing":
 
         board.push(move)
         st.session_state.move_count += 1
-        if "round_pointer" in st.session_state:
-            del st.session_state["round_pointer"]
+        if "view_index" in st.session_state:
+            del st.session_state["view_index"]
         st.session_state.selected_square = None
         st.rerun()
 
@@ -529,43 +531,37 @@ elif st.session_state.stage == "playing":
     if move_history:
         st.text_area("Move history", move_history, height=80, disabled=True)
 
-    # --- position browsing (by full round, not raw half-move) ---
+    # --- position browsing (one ply/half-move at a time) ---
     positions = get_position_history(board)
     last_index = len(positions) - 1
-    round_indices = get_round_boundary_indices(positions, st.session_state.user_plays_white)
-    total_rounds = len(round_indices) - 1  # excludes the starting position
 
-    if "round_pointer" not in st.session_state:
-        st.session_state.round_pointer = total_rounds
-    # whenever a new move has been played, snap the view back to live
-    if st.session_state.round_pointer > total_rounds:
-        st.session_state.round_pointer = total_rounds
+    if "view_index" not in st.session_state:
+        st.session_state.view_index = last_index
 
-    viewing_live = st.session_state.round_pointer == total_rounds
-    view_ply_index = round_indices[st.session_state.round_pointer]
+    viewing_live = st.session_state.view_index == last_index
 
     nav_cols = st.columns(4)
     with nav_cols[0]:
-        if st.button("|< Start", disabled=(st.session_state.round_pointer == 0)):
-            st.session_state.round_pointer = 0
+        if st.button("|< Start", disabled=(st.session_state.view_index == 0)):
+            st.session_state.view_index = 0
             st.rerun()
     with nav_cols[1]:
-        if st.button("< Back", disabled=(st.session_state.round_pointer == 0)):
-            st.session_state.round_pointer -= 1
+        if st.button("< Back", disabled=(st.session_state.view_index == 0)):
+            st.session_state.view_index -= 1
             st.rerun()
     with nav_cols[2]:
         if st.button("Forward >", disabled=viewing_live):
-            st.session_state.round_pointer += 1
+            st.session_state.view_index += 1
             st.rerun()
     with nav_cols[3]:
         if st.button("Current >|", disabled=viewing_live):
-            st.session_state.round_pointer = total_rounds
+            st.session_state.view_index = last_index
             st.rerun()
 
     if not viewing_live:
-        st.info(f"Viewing move {st.session_state.round_pointer} of {total_rounds} — not the current position.")
+        st.info(f"Viewing move {st.session_state.view_index} of {last_index} — not the current position.")
 
-    display_board = positions[view_ply_index]
+    display_board = positions[st.session_state.view_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
 
     if viewing_live and not board.is_game_over():
@@ -604,8 +600,8 @@ elif st.session_state.stage == "playing":
                     if move in board.legal_moves:
                         board.push(move)
                         st.session_state.move_count += 1
-                        if "round_pointer" in st.session_state:
-                            del st.session_state["round_pointer"]
+                        if "view_index" in st.session_state:
+                            del st.session_state["view_index"]
                         st.session_state.selected_square = None
                         st.rerun()
                     elif piece_at_click is not None and piece_at_click.color == side_to_move:
@@ -618,7 +614,10 @@ elif st.session_state.stage == "playing":
                         st.rerun()
     else:
         # browsing history or game over -- static, non-clickable image
-        board_svg = chess.svg.board(board=display_board, size=400, orientation=board_orientation)
+        static_check_square = display_board.king(display_board.turn) if display_board.is_check() else None
+        board_svg = chess.svg.board(
+            board=display_board, size=400, orientation=board_orientation, check=static_check_square
+        )
         st.image(board_svg, use_container_width=False)
 
     if board.is_game_over() and viewing_live:
