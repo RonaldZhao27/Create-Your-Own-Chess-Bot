@@ -534,7 +534,7 @@ def get_engine():
 
 # ---- Streamlit app ----
 
-st.set_page_config(page_title="Play Your Own Chess Bot", layout="centered")
+st.set_page_config(page_title="Play Your Own Chess Bot", layout="wide")
 st.title("Play Your Own Chess Bot")
 st.caption("Enter any Chess.com username to build a bot that plays like them.")
 st.link_button("Report a bug / suggestion", FEEDBACK_FORM_URL)
@@ -636,7 +636,7 @@ elif st.session_state.stage == "playing":
     display_board = positions[st.session_state.view_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
 
-    board_col, moves_col = st.columns([3, 1])
+    board_col, moves_col = st.columns([3, 2])
 
     with board_col:
         if viewing_live and not board.is_game_over():
@@ -702,45 +702,51 @@ elif st.session_state.stage == "playing":
             st.image(board_svg, use_container_width=False)
 
     with moves_col:
-        # --- clickable move list table, Lichess-style, kept narrow ---
+        # --- clickable move list table, Lichess-style ---
         move_rows = get_move_list_rows(board)
         if move_rows:
             for move_num, white_san, white_ply, black_san, black_ply in move_rows:
-                st.caption(f"{move_num}.")
-                is_active = st.session_state.view_index == white_ply
-                if st.button(
-                    white_san,
-                    key=f"movelist_white_{white_ply}",
-                    type="primary" if is_active else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state.view_index = white_ply
-                    st.rerun()
-                if black_san is not None:
-                    is_active = st.session_state.view_index == black_ply
+                num_col, white_col, black_col = st.columns([1, 2, 2])
+                with num_col:
+                    st.write(f"{move_num}.")
+                with white_col:
+                    is_active = st.session_state.view_index == white_ply
                     if st.button(
-                        black_san,
-                        key=f"movelist_black_{black_ply}",
+                        white_san,
+                        key=f"movelist_white_{white_ply}",
                         type="primary" if is_active else "secondary",
                         use_container_width=True,
                     ):
-                        st.session_state.view_index = black_ply
+                        st.session_state.view_index = white_ply
                         st.rerun()
+                with black_col:
+                    if black_san is not None:
+                        is_active = st.session_state.view_index == black_ply
+                        if st.button(
+                            black_san,
+                            key=f"movelist_black_{black_ply}",
+                            type="primary" if is_active else "secondary",
+                            use_container_width=True,
+                        ):
+                            st.session_state.view_index = black_ply
+                            st.rerun()
 
-        nav_cols = st.columns(2)
+        nav_cols = st.columns(4)
         with nav_cols[0]:
-            if st.button("|<", disabled=(st.session_state.view_index == 0), use_container_width=True):
+            if st.button("|<", disabled=(st.session_state.view_index == 0)):
                 st.session_state.view_index = 0
                 st.rerun()
-            if st.button("<", disabled=(st.session_state.view_index == 0), use_container_width=True):
+        with nav_cols[1]:
+            if st.button("<", disabled=(st.session_state.view_index == 0)):
                 st.session_state.view_index -= 1
                 st.rerun()
-        with nav_cols[1]:
-            if st.button(">|", disabled=viewing_live, use_container_width=True):
-                st.session_state.view_index = last_index
-                st.rerun()
-            if st.button(">", disabled=viewing_live, use_container_width=True):
+        with nav_cols[2]:
+            if st.button(">", disabled=viewing_live):
                 st.session_state.view_index += 1
+                st.rerun()
+        with nav_cols[3]:
+            if st.button(">|", disabled=viewing_live):
+                st.session_state.view_index = last_index
                 st.rerun()
 
     if board.is_game_over() and viewing_live:
