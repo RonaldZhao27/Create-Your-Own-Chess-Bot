@@ -374,40 +374,14 @@ def get_board_grid_geometry(svg_text, size):
         if abs(w - h) < 0.01 and 0 < w < size / 2:
             candidates.append((round(x, 2), round(y, 2), w))
 
-    def fallback():
-        # assume the grid fills the image with no margin -- safe default
+    if not candidates:
+        # fallback: assume the grid fills the image with no margin
         return 0.0, 0.0, size / 8
 
-    if not candidates:
-        return fallback()
-
-    # A real chessboard has exactly 64 same-sized squares. If something
-    # else in the SVG (a coordinate label's background, a border rect)
-    # slipped through the filter above, trusting it blindly can silently
-    # shift the whole grid by a fraction of a square -- exactly the kind
-    # of bug that shows up as "clicks land one row off." So instead of
-    # trusting the first/smallest match, use the most COMMON square size
-    # (the real squares should vastly outnumber any stray false match),
-    # and only keep candidates matching that size before computing origin.
-    size_counts = {}
-    for _, _, w in candidates:
-        size_counts[w] = size_counts.get(w, 0) + 1
-    most_common_size = max(size_counts, key=size_counts.get)
-
-    filtered = [c for c in candidates if abs(c[2] - most_common_size) < 0.5]
-
-    # Sanity checks: we should have (close to) 64 real squares, and the
-    # detected square size should be reasonably close to size/8. If not,
-    # something is off and it's safer to fall back than to trust it.
-    if len(filtered) < 32:
-        return fallback()
-    expected_square_size = size / 8
-    if not (0.5 * expected_square_size < most_common_size < 1.5 * expected_square_size):
-        return fallback()
-
-    origin_x = min(c[0] for c in filtered)
-    origin_y = min(c[1] for c in filtered)
-    return origin_x, origin_y, most_common_size
+    square_size = candidates[0][2]
+    origin_x = min(c[0] for c in candidates)
+    origin_y = min(c[1] for c in candidates)
+    return origin_x, origin_y, square_size
 
 
 @st.cache_resource
@@ -662,7 +636,7 @@ elif st.session_state.stage == "playing":
     display_board = positions[st.session_state.view_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
 
-    board_col, moves_col = st.columns([2, 1])
+    board_col, moves_col = st.columns([3, 1])
 
     with board_col:
         if viewing_live and not board.is_game_over():
@@ -728,34 +702,30 @@ elif st.session_state.stage == "playing":
             st.image(board_svg, use_container_width=False)
 
     with moves_col:
-        # --- clickable move list table, Lichess-style: number, White, Black inline ---
+        # --- clickable move list table, Lichess-style, kept narrow ---
         move_rows = get_move_list_rows(board)
         if move_rows:
             for move_num, white_san, white_ply, black_san, black_ply in move_rows:
-                num_col, white_col, black_col = st.columns([1, 2, 2])
-                with num_col:
-                    st.write(f"{move_num}.")
-                with white_col:
-                    is_active = st.session_state.view_index == white_ply
+                st.caption(f"{move_num}.")
+                is_active = st.session_state.view_index == white_ply
+                if st.button(
+                    white_san,
+                    key=f"movelist_white_{white_ply}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.view_index = white_ply
+                    st.rerun()
+                if black_san is not None:
+                    is_active = st.session_state.view_index == black_ply
                     if st.button(
-                        white_san,
-                        key=f"movelist_white_{white_ply}",
+                        black_san,
+                        key=f"movelist_black_{black_ply}",
                         type="primary" if is_active else "secondary",
                         use_container_width=True,
                     ):
-                        st.session_state.view_index = white_ply
+                        st.session_state.view_index = black_ply
                         st.rerun()
-                with black_col:
-                    if black_san is not None:
-                        is_active = st.session_state.view_index == black_ply
-                        if st.button(
-                            black_san,
-                            key=f"movelist_black_{black_ply}",
-                            type="primary" if is_active else "secondary",
-                            use_container_width=True,
-                        ):
-                            st.session_state.view_index = black_ply
-                            st.rerun()
 
         nav_cols = st.columns(2)
         with nav_cols[0]:
