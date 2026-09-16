@@ -37,6 +37,9 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 FEEDBACK_FORM_URL = "https://forms.gle/e1PbTnmRrAUj15UV8"
 
+BOARD_SIZE = 340  # display size in pixels -- kept modest so it fits comfortably on mobile screens without horizontal scrolling
+RENDER_SUPERSAMPLE = 3  # render internally at this many times BOARD_SIZE, then downsample -- fixes blurriness on high-DPI (mobile) screens
+
 
 TIME_CLASSES = {"rapid", "blitz"}
 MULTIPV = 5
@@ -388,8 +391,8 @@ def get_grid_geometry():
     same coordinate settings every time) -- only the pieces move -- so
     we measure it once on a fresh board and reuse it everywhere.
     """
-    sample_svg = chess.svg.board(board=chess.Board(), size=400, coordinates=True)
-    return get_board_grid_geometry(sample_svg, 400)
+    sample_svg = chess.svg.board(board=chess.Board(), size=BOARD_SIZE, coordinates=True)
+    return get_board_grid_geometry(sample_svg, BOARD_SIZE)
 
 
 def render_board_image(board, orientation, selected_square=None):
@@ -423,7 +426,7 @@ def render_board_image(board, orientation, selected_square=None):
 
     svg_text = chess.svg.board(
         board=board,
-        size=400,
+        size=BOARD_SIZE,
         orientation=orientation,
         fill=fill,
         check=check_square,
@@ -465,8 +468,15 @@ def render_board_image(board, orientation, selected_square=None):
                 )
         svg_text = svg_text.replace("</svg>", markers_svg + "</svg>")
 
-    png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=400, output_height=400)
-    return Image.open(io.BytesIO(png_bytes))
+    # Render at a much higher internal resolution, then downsample back
+    # down to BOARD_SIZE -- this "supersampling" produces much crisper,
+    # anti-aliased edges than rendering directly at the display size,
+    # which was the cause of the blurriness on high-DPI (mobile) screens.
+    render_size = BOARD_SIZE * RENDER_SUPERSAMPLE
+    png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), output_width=render_size, output_height=render_size)
+    image = Image.open(io.BytesIO(png_bytes))
+    image = image.resize((BOARD_SIZE, BOARD_SIZE), Image.LANCZOS)
+    return image
 
 
 def square_from_click(x, y, orientation):
@@ -524,7 +534,7 @@ def get_engine():
 
 # ---- Streamlit app ----
 
-st.set_page_config(page_title="Play Your Own Chess Bot", layout="centered")
+st.set_page_config(page_title="Play Your Own Chess Bot", layout="wide")
 st.title("Play Your Own Chess Bot")
 st.caption("Enter any Chess.com username to build a bot that plays like them.")
 st.link_button("Report a bug / suggestion", FEEDBACK_FORM_URL)
@@ -623,118 +633,121 @@ elif st.session_state.stage == "playing":
         st.session_state.view_index = last_index
 
     viewing_live = st.session_state.view_index == last_index
-
-    # --- clickable move list table, Lichess-style ---
-    move_rows = get_move_list_rows(board)
-    if move_rows:
-        for move_num, white_san, white_ply, black_san, black_ply in move_rows:
-            num_col, white_col, black_col = st.columns([1, 2, 2])
-            with num_col:
-                st.write(f"{move_num}.")
-            with white_col:
-                is_active = st.session_state.view_index == white_ply
-                if st.button(
-                    white_san,
-                    key=f"movelist_white_{white_ply}",
-                    type="primary" if is_active else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state.view_index = white_ply
-                    st.rerun()
-            with black_col:
-                if black_san is not None:
-                    is_active = st.session_state.view_index == black_ply
-                    if st.button(
-                        black_san,
-                        key=f"movelist_black_{black_ply}",
-                        type="primary" if is_active else "secondary",
-                        use_container_width=True,
-                    ):
-                        st.session_state.view_index = black_ply
-                        st.rerun()
-
-    nav_cols = st.columns(4)
-    with nav_cols[0]:
-        if st.button("|< Start", disabled=(st.session_state.view_index == 0)):
-            st.session_state.view_index = 0
-            st.rerun()
-    with nav_cols[1]:
-        if st.button("< Back", disabled=(st.session_state.view_index == 0)):
-            st.session_state.view_index -= 1
-            st.rerun()
-    with nav_cols[2]:
-        if st.button("Forward >", disabled=viewing_live):
-            st.session_state.view_index += 1
-            st.rerun()
-    with nav_cols[3]:
-        if st.button("Current >|", disabled=viewing_live):
-            st.session_state.view_index = last_index
-            st.rerun()
-
     display_board = positions[st.session_state.view_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
 
-    if viewing_live and not board.is_game_over():
-        # click-to-move: render as a clickable image instead of a static one
-        board_image = render_board_image(display_board, board_orientation, st.session_state.selected_square)
-        click_result = streamlit_image_coordinates(board_image, key="board_click")
+    board_col, moves_col = st.columns([3, 2])
 
-        if click_result is not None and click_result != st.session_state.last_click_processed:
-            st.session_state.last_click_processed = click_result
-            clicked_square = square_from_click(click_result["x"], click_result["y"], board_orientation)
-            piece_at_click = board.piece_at(clicked_square)
-            side_to_move = board.turn
+    with board_col:
+        if viewing_live and not board.is_game_over():
+            # click-to-move: render as a clickable image instead of a static one
+            board_image = render_board_image(display_board, board_orientation, st.session_state.selected_square)
+            click_result = streamlit_image_coordinates(board_image, key="board_click")
 
-            if st.session_state.selected_square is None:
-                # first click: only select if there's actually a piece
-                # belonging to whoever's turn it is
-                if piece_at_click is not None and piece_at_click.color == side_to_move:
-                    st.session_state.selected_square = clicked_square
-                    st.rerun()
-            else:
-                if clicked_square == st.session_state.selected_square:
-                    # clicking the same square again deselects it
-                    st.session_state.selected_square = None
-                    st.rerun()
-                else:
-                    from_sq = st.session_state.selected_square
-                    move = chess.Move(from_sq, clicked_square)
+            if click_result is not None and click_result != st.session_state.last_click_processed:
+                st.session_state.last_click_processed = click_result
+                clicked_square = square_from_click(click_result["x"], click_result["y"], board_orientation)
+                piece_at_click = board.piece_at(clicked_square)
+                side_to_move = board.turn
 
-                    # handle pawn promotion -- defaults to queen for now
-                    moving_piece = board.piece_at(from_sq)
-                    if moving_piece is not None and moving_piece.piece_type == chess.PAWN:
-                        promo_rank = 7 if moving_piece.color == chess.WHITE else 0
-                        if chess.square_rank(clicked_square) == promo_rank:
-                            move = chess.Move(from_sq, clicked_square, promotion=chess.QUEEN)
-
-                    if move in board.legal_moves:
-                        board.push(move)
-                        st.session_state.move_count += 1
-                        if "view_index" in st.session_state:
-                            del st.session_state["view_index"]
-                        st.session_state.selected_square = None
-                        st.rerun()
-                    elif piece_at_click is not None and piece_at_click.color == side_to_move:
-                        # clicked a different one of your own pieces -- reselect
+                if st.session_state.selected_square is None:
+                    # first click: only select if there's actually a piece
+                    # belonging to whoever's turn it is
+                    if piece_at_click is not None and piece_at_click.color == side_to_move:
                         st.session_state.selected_square = clicked_square
                         st.rerun()
-                    else:
+                else:
+                    if clicked_square == st.session_state.selected_square:
+                        # clicking the same square again deselects it
                         st.session_state.selected_square = None
-                        st.warning("That's not a legal move.")
                         st.rerun()
-    else:
-        # browsing history or game over -- static, non-clickable image
-        static_check_square = display_board.king(display_board.turn) if display_board.is_check() else None
-        static_last_move = display_board.peek() if display_board.move_stack else None
-        board_svg = chess.svg.board(
-            board=display_board,
-            size=400,
-            orientation=board_orientation,
-            check=static_check_square,
-            lastmove=static_last_move,
-            coordinates=True,
-        )
-        st.image(board_svg, use_container_width=False)
+                    else:
+                        from_sq = st.session_state.selected_square
+                        move = chess.Move(from_sq, clicked_square)
+
+                        # handle pawn promotion -- defaults to queen for now
+                        moving_piece = board.piece_at(from_sq)
+                        if moving_piece is not None and moving_piece.piece_type == chess.PAWN:
+                            promo_rank = 7 if moving_piece.color == chess.WHITE else 0
+                            if chess.square_rank(clicked_square) == promo_rank:
+                                move = chess.Move(from_sq, clicked_square, promotion=chess.QUEEN)
+
+                        if move in board.legal_moves:
+                            board.push(move)
+                            st.session_state.move_count += 1
+                            if "view_index" in st.session_state:
+                                del st.session_state["view_index"]
+                            st.session_state.selected_square = None
+                            st.rerun()
+                        elif piece_at_click is not None and piece_at_click.color == side_to_move:
+                            # clicked a different one of your own pieces -- reselect
+                            st.session_state.selected_square = clicked_square
+                            st.rerun()
+                        else:
+                            st.session_state.selected_square = None
+                            st.warning("That's not a legal move.")
+                            st.rerun()
+        else:
+            # browsing history or game over -- static, non-clickable image
+            static_check_square = display_board.king(display_board.turn) if display_board.is_check() else None
+            static_last_move = display_board.peek() if display_board.move_stack else None
+            board_svg = chess.svg.board(
+                board=display_board,
+                size=BOARD_SIZE,
+                orientation=board_orientation,
+                check=static_check_square,
+                lastmove=static_last_move,
+                coordinates=True,
+            )
+            st.image(board_svg, use_container_width=False)
+
+    with moves_col:
+        # --- clickable move list table, Lichess-style ---
+        move_rows = get_move_list_rows(board)
+        if move_rows:
+            for move_num, white_san, white_ply, black_san, black_ply in move_rows:
+                num_col, white_col, black_col = st.columns([1, 2, 2])
+                with num_col:
+                    st.write(f"{move_num}.")
+                with white_col:
+                    is_active = st.session_state.view_index == white_ply
+                    if st.button(
+                        white_san,
+                        key=f"movelist_white_{white_ply}",
+                        type="primary" if is_active else "secondary",
+                        use_container_width=True,
+                    ):
+                        st.session_state.view_index = white_ply
+                        st.rerun()
+                with black_col:
+                    if black_san is not None:
+                        is_active = st.session_state.view_index == black_ply
+                        if st.button(
+                            black_san,
+                            key=f"movelist_black_{black_ply}",
+                            type="primary" if is_active else "secondary",
+                            use_container_width=True,
+                        ):
+                            st.session_state.view_index = black_ply
+                            st.rerun()
+
+        nav_cols = st.columns(4)
+        with nav_cols[0]:
+            if st.button("|<", disabled=(st.session_state.view_index == 0)):
+                st.session_state.view_index = 0
+                st.rerun()
+        with nav_cols[1]:
+            if st.button("<", disabled=(st.session_state.view_index == 0)):
+                st.session_state.view_index -= 1
+                st.rerun()
+        with nav_cols[2]:
+            if st.button(">", disabled=viewing_live):
+                st.session_state.view_index += 1
+                st.rerun()
+        with nav_cols[3]:
+            if st.button(">|", disabled=viewing_live):
+                st.session_state.view_index = last_index
+                st.rerun()
 
     if board.is_game_over() and viewing_live:
         st.success(f"Game over: {board.result()}")
