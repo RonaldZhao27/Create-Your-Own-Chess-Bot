@@ -294,10 +294,14 @@ def weighted_choice(options_dict):
     return random.choices(choices, weights=weights, k=1)[0]
 
 
-def get_move_history_string(final_board):
+def get_move_list_rows(final_board):
     """
-    Replays the game from the start to build a readable move list like:
-    "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"
+    Replays the game from the start and returns one row per full move:
+    (move_number, white_san, white_ply_index, black_san, black_ply_index).
+    ply_index refers to the position in get_position_history()'s output
+    (position 0 = start, position N = after N plies), so clicking a move
+    can jump the viewer straight to that exact position.
+    black_san/black_ply_index are None if Black hasn't moved yet that round.
     """
     history_board = chess.Board()
     moves_san = []
@@ -305,13 +309,19 @@ def get_move_history_string(final_board):
         moves_san.append(history_board.san(move))
         history_board.push(move)
 
-    formatted = []
+    rows = []
     for i in range(0, len(moves_san), 2):
         move_num = i // 2 + 1
-        white_move = moves_san[i]
-        black_move = moves_san[i + 1] if i + 1 < len(moves_san) else ""
-        formatted.append(f"{move_num}. {white_move} {black_move}".strip())
-    return "  ".join(formatted)
+        white_san = moves_san[i]
+        white_ply = i + 1
+        if i + 1 < len(moves_san):
+            black_san = moves_san[i + 1]
+            black_ply = i + 2
+        else:
+            black_san = None
+            black_ply = None
+        rows.append((move_num, white_san, white_ply, black_san, black_ply))
+    return rows
 
 
 def get_position_history(final_board):
@@ -605,10 +615,6 @@ elif st.session_state.stage == "playing":
         st.session_state.selected_square = None
         st.rerun()
 
-    move_history = get_move_history_string(board)
-    if move_history:
-        st.text_area("Move history", move_history, height=80, disabled=True)
-
     # --- position browsing (one ply/half-move at a time) ---
     positions = get_position_history(board)
     last_index = len(positions) - 1
@@ -617,6 +623,35 @@ elif st.session_state.stage == "playing":
         st.session_state.view_index = last_index
 
     viewing_live = st.session_state.view_index == last_index
+
+    # --- clickable move list table, Lichess-style ---
+    move_rows = get_move_list_rows(board)
+    if move_rows:
+        for move_num, white_san, white_ply, black_san, black_ply in move_rows:
+            num_col, white_col, black_col = st.columns([1, 2, 2])
+            with num_col:
+                st.write(f"{move_num}.")
+            with white_col:
+                is_active = st.session_state.view_index == white_ply
+                if st.button(
+                    white_san,
+                    key=f"movelist_white_{white_ply}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.view_index = white_ply
+                    st.rerun()
+            with black_col:
+                if black_san is not None:
+                    is_active = st.session_state.view_index == black_ply
+                    if st.button(
+                        black_san,
+                        key=f"movelist_black_{black_ply}",
+                        type="primary" if is_active else "secondary",
+                        use_container_width=True,
+                    ):
+                        st.session_state.view_index = black_ply
+                        st.rerun()
 
     nav_cols = st.columns(4)
     with nav_cols[0]:
@@ -635,9 +670,6 @@ elif st.session_state.stage == "playing":
         if st.button("Current >|", disabled=viewing_live):
             st.session_state.view_index = last_index
             st.rerun()
-
-    if not viewing_live:
-        st.info(f"Viewing move {st.session_state.view_index} of {last_index} — not the current position.")
 
     display_board = positions[st.session_state.view_index]
     board_orientation = chess.WHITE if st.session_state.user_plays_white else chess.BLACK
